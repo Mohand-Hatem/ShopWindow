@@ -6,12 +6,32 @@ import { FindProductsQueryDto } from './dto/find-products-query.dto';
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+export const PRODUCT_DETAIL_TTL = 300; // 5 minutes (300 seconds)
+export const PRODUCT_LIST_TTL = 120;   // 2 minutes (120 seconds)
+
 export type CacheStatus = 'HIT' | 'MISS' | 'BYPASS';
 
 export interface ProductDetailResult {
   data: any;
   cacheStatus: CacheStatus;
 }
+
+export interface PaginatedProductsResult {
+  items: any[];
+  total: number;
+  page: number;
+  limit: number;
+  totalPages: number;
+}
+
+export interface ProductListResult {
+  data: PaginatedProductsResult;
+  cacheStatus: CacheStatus;
+}
+
+import { buildCanonicalListCacheKey, normalizeProductQuery } from '../cache/query-normalizer';
+
+export const buildListCacheKey = buildCanonicalListCacheKey;
 
 @Injectable()
 export class ProductsService {
@@ -20,48 +40,59 @@ export class ProductsService {
     @Inject(CACHE_PORT) private readonly cache: CachePort,
   ) {}
 
-  async findAll(query: FindProductsQueryDto) {
-    const page = query.page ?? 1;
-    const limit = query.limit ?? 20;
+  async findAll(query: FindProductsQueryDto): Promise<ProductListResult> {
+    const listVer = await this.cache.getListVersion();
+    const norm = normalizeProductQuery(query);
+    const cacheKey = buildCanonicalListCacheKey(query, listVer);
+
+    // 1. Check Redis for cached collection
+    const cached = await this.cache.get<PaginatedProductsResult>(cacheKey);
+    if (cached) {
+      return {
+        data: cached,
+        cacheStatus: 'HIT',
+      };
+    }
+
+    // 2. Cache MISS -> execute PostgreSQL queries with normalized inputs
+    const page = norm.page;
+    const limit = norm.limit;
     const skip = (page - 1) * limit;
 
-    // 1. Build filtering conditions (only ACTIVE products)
     const where: Prisma.ProductWhereInput = {
       status: ProductStatus.ACTIVE,
     };
 
-    if (query.category) {
-      where.category = { slug: query.category };
+    if (norm.category) {
+      where.category = { slug: norm.category };
     }
 
-    if (query.q) {
+    if (norm.q) {
       where.OR = [
-        { name: { contains: query.q, mode: 'insensitive' } },
-        { description: { contains: query.q, mode: 'insensitive' } },
+        { name: { contains: norm.q, mode: 'insensitive' } },
+        { description: { contains: norm.q, mode: 'insensitive' } },
       ];
     }
 
-    if (query.minPrice !== undefined || query.maxPrice !== undefined) {
+    if (norm.minPrice !== undefined || norm.maxPrice !== undefined) {
       where.price = {};
-      if (query.minPrice !== undefined) {
-        where.price.gte = query.minPrice;
+      if (norm.minPrice !== undefined) {
+        where.price.gte = norm.minPrice;
       }
-      if (query.maxPrice !== undefined) {
-        where.price.lte = query.maxPrice;
+      if (norm.maxPrice !== undefined) {
+        where.price.lte = norm.maxPrice;
       }
     }
 
-    // 2. Build sorting
     let orderBy: Prisma.ProductOrderByWithRelationInput = { updatedAt: 'desc' };
-    if (query.sort === 'price_asc') {
+    if (norm.sort === 'price_asc') {
       orderBy = { price: 'asc' };
-    } else if (query.sort === 'price_desc') {
+    } else if (norm.sort === 'price_desc') {
       orderBy = { price: 'desc' };
-    } else if (query.sort === 'newest') {
+    } else if (norm.sort === 'newest') {
       orderBy = { updatedAt: 'desc' };
     }
 
-    // 3. Execute parallel queries directly on PostgreSQL (Uncached baseline)
     const [items, total] = await Promise.all([
       this.prisma.product.findMany({
         where,
@@ -79,20 +110,28 @@ export class ProductsService {
 
     const totalPages = Math.ceil(total / limit) || 1;
 
-    return {
+    const result: PaginatedProductsResult = {
       items,
       total,
       page,
       limit,
       totalPages,
     };
+
+    // 3. Store collection in Redis with 120s TTL
+    await this.cache.set(cacheKey, result, PRODUCT_LIST_TTL);
+
+    return {
+      data: result,
+      cacheStatus: 'MISS',
+    };
   }
 
   /**
-   * Cache-Aside Pattern:
+   * Cache-Aside Pattern for Product Detail:
    * 1. Check Redis for prod:detail:id:{id} or prod:detail:slug:{slug}
    * 2. If HIT -> Return cached data immediately
-   * 3. If MISS -> Query database, populate both ID and Slug cache keys, then return
+   * 3. If MISS -> Query database, populate both ID and Slug cache keys with 300s TTL, then return
    */
   async findByIdOrSlug(idOrSlug: string): Promise<ProductDetailResult> {
     const isUuid = UUID_REGEX.test(idOrSlug);
@@ -126,10 +165,10 @@ export class ProductsService {
       throw new NotFoundException(`Product with identifier "${idOrSlug}" not found`);
     }
 
-    // 3. Populate cache under both ID and Slug keys for instant cross-resolution
+    // 3. Populate cache under both ID and Slug keys for instant cross-resolution with 5-minute TTL
     await Promise.all([
-      this.cache.set(`prod:detail:id:${product.id}`, product),
-      this.cache.set(`prod:detail:slug:${product.slug}`, product),
+      this.cache.set(`prod:detail:id:${product.id}`, product, PRODUCT_DETAIL_TTL),
+      this.cache.set(`prod:detail:slug:${product.slug}`, product, PRODUCT_DETAIL_TTL),
     ]);
 
     return {

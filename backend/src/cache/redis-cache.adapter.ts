@@ -69,6 +69,15 @@ export class RedisCacheAdapter implements CachePort {
   }
 
   /**
+   * Returns remaining TTL in seconds.
+   * Returns -2 if key does not exist.
+   * Returns -1 if key exists without TTL.
+   */
+  async ttl(key: string): Promise<number> {
+    return await this.redis.ttl(key);
+  }
+
+  /**
    * Health check via Redis PING command.
    */
   async isHealthy(): Promise<boolean> {
@@ -78,6 +87,38 @@ export class RedisCacheAdapter implements CachePort {
     } catch (error: any) {
       this.logger.warn(`Redis healthcheck failed: ${error.message}`);
       return false;
+    }
+  }
+
+  /**
+   * Reads current catalog list version counter.
+   * Returns 1 if uninitialized or upon read errors.
+   */
+  async getListVersion(): Promise<number> {
+    try {
+      const raw = await this.redis.get('prod:listVer');
+      if (!raw) {
+        return 1;
+      }
+      const parsed = parseInt(raw, 10);
+      return isNaN(parsed) || parsed < 1 ? 1 : parsed;
+    } catch (error: any) {
+      this.logger.warn(`Failed to read list version from Redis: ${error.message}`);
+      return 1;
+    }
+  }
+
+  /**
+   * Atomically increments list version counter to invalidate all cached lists in O(1) time.
+   */
+  async bumpListVersion(): Promise<number> {
+    try {
+      const newVersion = await this.redis.incr('prod:listVer');
+      this.logger.log(`Bumped catalog list version to v=${newVersion}`);
+      return newVersion;
+    } catch (error: any) {
+      this.logger.error(`Failed to bump list version in Redis: ${error.message}`);
+      throw error;
     }
   }
 }

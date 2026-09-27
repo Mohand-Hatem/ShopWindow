@@ -13,6 +13,7 @@ describe('RedisCacheAdapter (Unit Tests)', () => {
       del: jest.fn(),
       scan: jest.fn(),
       incr: jest.fn(),
+      ttl: jest.fn(),
       ping: jest.fn(),
     };
 
@@ -119,6 +120,30 @@ describe('RedisCacheAdapter (Unit Tests)', () => {
     });
   });
 
+  describe('ttl()', () => {
+    it('should return remaining seconds when key has a TTL', async () => {
+      mockRedis.ttl.mockResolvedValue(285);
+
+      const remaining = await adapter.ttl('prod:detail:slug:test');
+      expect(remaining).toBe(285);
+      expect(mockRedis.ttl).toHaveBeenCalledWith('prod:detail:slug:test');
+    });
+
+    it('should return -1 when key exists without expiration', async () => {
+      mockRedis.ttl.mockResolvedValue(-1);
+
+      const remaining = await adapter.ttl('immortal:key');
+      expect(remaining).toBe(-1);
+    });
+
+    it('should return -2 when key does not exist', async () => {
+      mockRedis.ttl.mockResolvedValue(-2);
+
+      const remaining = await adapter.ttl('expired:key');
+      expect(remaining).toBe(-2);
+    });
+  });
+
   describe('isHealthy()', () => {
     it('should return true when redis.ping() returns PONG', async () => {
       mockRedis.ping.mockResolvedValue('PONG');
@@ -132,6 +157,40 @@ describe('RedisCacheAdapter (Unit Tests)', () => {
 
       const healthy = await adapter.isHealthy();
       expect(healthy).toBe(false);
+    });
+  });
+
+  describe('getListVersion()', () => {
+    it('should return 1 when key is not in Redis', async () => {
+      mockRedis.get.mockResolvedValue(null);
+
+      const ver = await adapter.getListVersion();
+      expect(ver).toBe(1);
+      expect(mockRedis.get).toHaveBeenCalledWith('prod:listVer');
+    });
+
+    it('should return parsed integer when version exists in Redis', async () => {
+      mockRedis.get.mockResolvedValue('7');
+
+      const ver = await adapter.getListVersion();
+      expect(ver).toBe(7);
+    });
+
+    it('should return 1 when redis throws an error', async () => {
+      mockRedis.get.mockRejectedValue(new Error('Redis offline'));
+
+      const ver = await adapter.getListVersion();
+      expect(ver).toBe(1);
+    });
+  });
+
+  describe('bumpListVersion()', () => {
+    it('should call redis.incr and return the new version number', async () => {
+      mockRedis.incr.mockResolvedValue(8);
+
+      const ver = await adapter.bumpListVersion();
+      expect(ver).toBe(8);
+      expect(mockRedis.incr).toHaveBeenCalledWith('prod:listVer');
     });
   });
 });

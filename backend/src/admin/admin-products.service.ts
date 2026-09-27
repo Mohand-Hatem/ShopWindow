@@ -1,12 +1,16 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, NotFoundException, Inject } from '@nestjs/common';
 import { ProductStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { CACHE_PORT, CachePort } from '../cache/cache.port';
 import { CreateProductDto } from './dto/create-product.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
 
 @Injectable()
 export class AdminProductsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    @Inject(CACHE_PORT) private readonly cache: CachePort,
+  ) {}
 
   async create(dto: CreateProductDto) {
     const category = await this.prisma.category.findUnique({
@@ -17,7 +21,7 @@ export class AdminProductsService {
       throw new NotFoundException(`Category with id "${dto.categoryId}" not found`);
     }
 
-    return this.prisma.product.create({
+    const created = await this.prisma.product.create({
       data: {
         sku: dto.sku,
         name: dto.name,
@@ -33,6 +37,14 @@ export class AdminProductsService {
         category: true,
       },
     });
+
+    // Invalidate any potential stale negative cache for this slug
+    await this.cache.del(`prod:detail:slug:${created.slug}`);
+
+    // Bump catalog list version to immediately invalidate all cached listings in O(1)
+    await this.cache.bumpListVersion();
+
+    return created;
   }
 
   async update(id: string, dto: UpdateProductDto) {
@@ -53,7 +65,8 @@ export class AdminProductsService {
       }
     }
 
-    return this.prisma.product.update({
+    // 1. Commit update to PostgreSQL first (Database-First Order)
+    const updated = await this.prisma.product.update({
       where: { id },
       data: {
         ...(dto.sku && { sku: dto.sku }),
@@ -69,6 +82,22 @@ export class AdminProductsService {
         category: true,
       },
     });
+
+    // 2. Active Cache Invalidation: Evict ID key, old slug key, and new slug key
+    const keysToInvalidate = new Set<string>([
+      `prod:detail:id:${id}`,
+      `prod:detail:slug:${existing.slug}`,
+      `prod:detail:slug:${updated.slug}`,
+    ]);
+
+    await Promise.all(
+      Array.from(keysToInvalidate).map((key) => this.cache.del(key)),
+    );
+
+    // Bump catalog list version to immediately invalidate all cached listings in O(1)
+    await this.cache.bumpListVersion();
+
+    return updated;
   }
 
   async archive(id: string) {
@@ -80,12 +109,22 @@ export class AdminProductsService {
       throw new NotFoundException(`Product with id "${id}" not found`);
     }
 
+    // 1. Commit archive status to PostgreSQL
     const archived = await this.prisma.product.update({
       where: { id },
       data: {
         status: ProductStatus.ARCHIVED,
       },
     });
+
+    // 2. Active Cache Invalidation: Purge both ID and Slug keys immediately
+    await Promise.all([
+      this.cache.del(`prod:detail:id:${id}`),
+      this.cache.del(`prod:detail:slug:${existing.slug}`),
+    ]);
+
+    // Bump catalog list version to immediately invalidate all cached listings in O(1)
+    await this.cache.bumpListVersion();
 
     return {
       success: true,

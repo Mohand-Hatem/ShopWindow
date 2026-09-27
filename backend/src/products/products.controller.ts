@@ -8,8 +8,13 @@ export class ProductsController {
   constructor(private readonly productsService: ProductsService) {}
 
   @Get()
-  async findAll(@Query() query: FindProductsQueryDto) {
-    return this.productsService.findAll(query);
+  async findAll(
+    @Query() query: FindProductsQueryDto,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    const { data, cacheStatus } = await this.productsService.findAll(query);
+    res.setHeader('X-Cache', cacheStatus);
+    return data;
   }
 
   @Get(':idOrSlug')

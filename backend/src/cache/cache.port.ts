@@ -37,6 +37,25 @@ export interface CachePort {
   incr(key: string): Promise<number>;
 
   /**
+   * Return the remaining Time-To-Live of a key in seconds.
+   * Returns -2 if key does not exist.
+   * Returns -1 if key exists without expiration.
+   */
+  ttl(key: string): Promise<number>;
+
+  /**
+   * Get the current active version counter for catalog lists.
+   * Defaults to 1 if not yet initialized.
+   */
+  getListVersion(): Promise<number>;
+
+  /**
+   * Atomically increment the catalog list version counter and return the new version.
+   * Invalidates all cached lists in O(1) time without scanning keys.
+   */
+  bumpListVersion(): Promise<number>;
+
+  /**
    * Verify if the underlying cache engine is healthy and accepting commands.
    */
   isHealthy(): Promise<boolean>;

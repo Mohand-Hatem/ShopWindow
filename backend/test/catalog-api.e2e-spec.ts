@@ -3,6 +3,7 @@ import { INestApplication, ValidationPipe } from '@nestjs/common';
 const request = require('supertest');
 import { AppModule } from '../src/app.module';
 import { PrismaService } from '../src/prisma/prisma.service';
+import { CACHE_PORT, CachePort } from '../src/cache/cache.port';
 
 describe('Catalog API Endpoints (E2E Baseline - Uncached)', () => {
   let app: INestApplication;
@@ -25,6 +26,10 @@ describe('Catalog API Endpoints (E2E Baseline - Uncached)', () => {
 
     await app.init();
     prisma = app.get(PrismaService);
+
+    // Clean cache before running tests to ensure deterministic state
+    const cache = app.get<CachePort>(CACHE_PORT);
+    await cache.delByPattern('*');
 
     // Get a sample category for admin testing
     sampleCategory = await prisma.category.findFirst({ where: { slug: 'electronics' } });
@@ -107,6 +112,65 @@ describe('Catalog API Endpoints (E2E Baseline - Uncached)', () => {
         expect(Number(items[i].price)).toBeGreaterThanOrEqual(Number(items[i - 1].price));
       }
     });
+
+    it('should return X-Cache: HIT on subsequent identical list fetch', async () => {
+      // 1. First fetch (MISS or warm)
+      await request(app.getHttpServer())
+        .get('/products?page=1&limit=10')
+        .expect(200);
+
+      // 2. Second fetch MUST be a cache HIT
+      const hitRes = await request(app.getHttpServer())
+        .get('/products?page=1&limit=10')
+        .expect(200);
+
+      expect(hitRes.headers['x-cache']).toBe('HIT');
+      expect(hitRes.body.items.length).toBe(10);
+    });
+
+    it('should store list cache keys with a positive TTL <= 120 seconds', async () => {
+      await request(app.getHttpServer())
+        .get('/products?page=1&limit=10')
+        .expect(200);
+
+      const cache = app.get<CachePort>(CACHE_PORT);
+      const listVer = await cache.getListVersion();
+      const remainingTtl = await cache.ttl(`prod:list:v=${listVer}:lim=10:p=1:sort=newest`);
+
+      expect(remainingTtl).toBeGreaterThan(0);
+      expect(remainingTtl).toBeLessThanOrEqual(120);
+    });
+
+    it('should achieve cache HIT regardless of parameter order or redundant default values', async () => {
+      // 1. Initial request with page first, then limit
+      const firstRes = await request(app.getHttpServer())
+        .get('/products?page=2&limit=15')
+        .expect(200);
+      expect(firstRes.body.items.length).toBe(15);
+
+      // 2. Subsequent request with inverted query parameter order -> MUST HIT cache
+      const hitResOrder = await request(app.getHttpServer())
+        .get('/products?limit=15&page=2')
+        .expect(200);
+      expect(hitResOrder.headers['x-cache']).toBe('HIT');
+      expect(hitResOrder.body.items.length).toBe(15);
+
+      // 3. Subsequent request with explicit default sort (sort=newest) -> MUST HIT cache
+      const hitResDefault = await request(app.getHttpServer())
+        .get('/products?limit=15&page=2&sort=newest')
+        .expect(200);
+      expect(hitResDefault.headers['x-cache']).toBe('HIT');
+    });
+
+    it('should return X-Cache: MISS when query parameters differ', async () => {
+      const res = await request(app.getHttpServer())
+        .get('/products?page=3&limit=7&sort=price_desc')
+        .expect(200);
+
+      expect(res.headers['x-cache']).toBe('MISS');
+      expect(res.body.page).toBe(3);
+      expect(res.body.limit).toBe(7);
+    });
   });
 
   describe('GET /products/:idOrSlug', () => {
@@ -142,6 +206,23 @@ describe('Catalog API Endpoints (E2E Baseline - Uncached)', () => {
       expect(hitRes.body.slug).toBe(sample!.slug);
     });
 
+    it('should store cached product keys with a positive TTL <= 300 seconds', async () => {
+      const sample = await prisma.product.findFirst({ where: { status: 'ACTIVE' } });
+      expect(sample).toBeDefined();
+
+      // Ensure key is cached
+      await request(app.getHttpServer())
+        .get(`/products/${sample!.slug}`)
+        .expect(200);
+
+      const cache = app.get<CachePort>(CACHE_PORT);
+      const remainingTtl = await cache.ttl(`prod:detail:slug:${sample!.slug}`);
+
+      // Redis TTL must be active, positive, and <= 300
+      expect(remainingTtl).toBeGreaterThan(0);
+      expect(remainingTtl).toBeLessThanOrEqual(300);
+    });
+
     it('should return 404 for nonexistent product identifier', async () => {
       const res = await request(app.getHttpServer())
         .get('/products/completely-fake-product-slug-12345')
@@ -174,7 +255,20 @@ describe('Catalog API Endpoints (E2E Baseline - Uncached)', () => {
       createdProductId = res.body.id;
     });
 
-    it('PATCH /admin/products/:id should update product fields', async () => {
+    it('PATCH /admin/products/:id should update product and actively evict stale cache', async () => {
+      // 1. Warm the cache for this product
+      const warmRes = await request(app.getHttpServer())
+        .get(`/products/${createdProductId}`)
+        .expect(200);
+      expect(Number(warmRes.body.price)).toBe(299.99);
+
+      // Verify second fetch is a cache HIT
+      const hitRes = await request(app.getHttpServer())
+        .get(`/products/${createdProductId}`)
+        .expect(200);
+      expect(hitRes.headers['x-cache']).toBe('HIT');
+
+      // 2. Perform Admin Update (Price change: 299.99 -> 349.99)
       const updatePayload = {
         price: 349.99,
         stock: 50,
@@ -187,10 +281,28 @@ describe('Catalog API Endpoints (E2E Baseline - Uncached)', () => {
 
       expect(Number(res.body.price)).toBe(349.99);
       expect(res.body.stock).toBe(50);
+
+      // 3. Verify Redis cache was actively evicted!
+      const cache = app.get<CachePort>(CACHE_PORT);
+      const cachedAfterUpdate = await cache.get(`prod:detail:id:${createdProductId}`);
+      expect(cachedAfterUpdate).toBeNull();
+
+      // 4. Next customer fetch MUST be a cache MISS and return updated price immediately!
+      const freshRes = await request(app.getHttpServer())
+        .get(`/products/${createdProductId}`)
+        .expect(200);
+
+      expect(freshRes.headers['x-cache']).toBe('MISS');
+      expect(Number(freshRes.body.price)).toBe(349.99);
     });
 
-    it('DELETE /admin/products/:id should archive product and hide it from customer browse', async () => {
-      // 1. Archive
+    it('DELETE /admin/products/:id should archive product, evict cache, and hide it from customer browse', async () => {
+      // 1. Warm cache before archiving
+      await request(app.getHttpServer())
+        .get(`/products/${createdProductId}`)
+        .expect(200);
+
+      // 2. Archive
       const res = await request(app.getHttpServer())
         .delete(`/admin/products/${createdProductId}`)
         .expect(200);
@@ -198,10 +310,67 @@ describe('Catalog API Endpoints (E2E Baseline - Uncached)', () => {
       expect(res.body.success).toBe(true);
       expect(res.body.status).toBe('ARCHIVED');
 
-      // 2. Customer read for this archived product must return 404
+      // 3. Verify Redis cache was actively purged
+      const cache = app.get<CachePort>(CACHE_PORT);
+      const cachedAfterArchive = await cache.get(`prod:detail:id:${createdProductId}`);
+      expect(cachedAfterArchive).toBeNull();
+
+      // 4. Customer read for this archived product must return 404
       await request(app.getHttpServer())
         .get(`/products/${createdProductId}`)
         .expect(404);
+    });
+
+    it('Admin mutations should bump listVer and immediately invalidate cached catalog listings in O(1)', async () => {
+      const cache = app.get<CachePort>(CACHE_PORT);
+      const initialVer = await cache.getListVersion();
+
+      // 1. Warm catalog list cache
+      await request(app.getHttpServer())
+        .get('/products?page=1&limit=8')
+        .expect(200);
+
+      // Verify second fetch is a HIT
+      const hitRes = await request(app.getHttpServer())
+        .get('/products?page=1&limit=8')
+        .expect(200);
+      expect(hitRes.headers['x-cache']).toBe('HIT');
+
+      // 2. Perform an Admin Create mutation (bumps listVer)
+      const payload = {
+        sku: 'TEST-SKU-V-BUMP',
+        name: 'Version Bump Test Item',
+        slug: 'version-bump-test-item',
+        description: 'Verifying atomic O(1) version invalidation.',
+        price: 88.88,
+        categoryId: sampleCategory.id,
+        stock: 10,
+      };
+
+      await request(app.getHttpServer())
+        .post('/admin/products')
+        .send(payload)
+        .expect(201);
+
+      // 3. Verify Redis listVer counter was incremented
+      const bumpedVer = await cache.getListVersion();
+      expect(bumpedVer).toBe(initialVer + 1);
+
+      // 4. Next customer list fetch MUST be a cache MISS and return updated catalog!
+      const freshRes = await request(app.getHttpServer())
+        .get('/products?page=1&limit=8')
+        .expect(200);
+      expect(freshRes.headers['x-cache']).toBe('MISS');
+
+      // 5. Subsequent request is a cache HIT under the new version
+      const secondHitRes = await request(app.getHttpServer())
+        .get('/products?page=1&limit=8')
+        .expect(200);
+      expect(secondHitRes.headers['x-cache']).toBe('HIT');
+
+      // 6. Verify Redis holds the new key with the bumped version
+      const newKeyExists = await cache.get(`prod:list:v=${bumpedVer}:lim=8:p=1:sort=newest`);
+      expect(newKeyExists).not.toBeNull();
     });
   });
 });
