@@ -1,0 +1,60 @@
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum Role {
+  ADMIN
+  VIEWER
+}
+
+enum ProductStatus {
+  ACTIVE
+  ARCHIVED
+}
+
+model User {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  role      Role     @default(VIEWER)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("users")
+}
+
+model Category {
+  id        String    @id @default(uuid())
+  name      String
+  slug      String    @unique
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  products  Product[]
+
+  @@map("categories")
+}
+
+model Product {
+  id          String        @id @default(uuid())
+  sku         String        @unique
+  name        String
+  slug        String        @unique
+  description String
+  price       Decimal       @db.Decimal(10, 2)
+  currency    String        @default("USD")
+  categoryId  String
+  category    Category      @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  status      ProductStatus @default(ACTIVE)
+  stock       Int           @default(0)
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  @@index([categoryId, status])
+  @@index([status, updatedAt])
+  @@map("products")
+}
