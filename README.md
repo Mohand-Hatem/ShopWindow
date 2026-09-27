@@ -88,10 +88,10 @@ Check system diagnostics: `curl http://localhost:3000/health`.
 
 ### 6. Run Automated Tests
 ```bash
-# Unit tests (CachePort & ProductsService)
+# Unit tests (43 passing across CachePort, Adapters, Services, Normalizers)
 npm test
 
-# Full E2E integration test suite
+# Full E2E integration test suite (18 passing against PostgreSQL and Redis)
 npm run test:e2e
 
 # Run Autocannon baseline load test
@@ -108,11 +108,11 @@ npm run test:load:baseline
 - [x] **Phase 3:** Baseline Performance Benchmarking (Cold Autocannon load test: ~3.8s median latency recorded)
 - [x] **Phase 4:** Cache Abstraction Layer (`CachePort` interface, `RedisCacheAdapter`, Hexagonal Architecture)
 - [x] **Phase 5:** Cache-Aside Pattern for Product Detail (`X-Cache: HIT/MISS` headers, 120x speedup down to ~5-7ms)
-- [ ] **Phase 6:** Time-To-Live (TTL) Policy & Eviction
-- [ ] **Phase 7:** Active Cache Invalidation (Write Path Mutation)
-- [ ] **Phase 8:** Product List Caching (Multi-Dimensional Key Generation)
-- [ ] **Phase 9:** Query Normalization & Stable Cache Keys
-- [ ] **Phase 10:** Version-Based List Invalidation (`listVer`)
+- [x] **Phase 6:** Time-To-Live (TTL) Policy & Eviction (`PRODUCT_DETAIL_TTL = 300s`, active expiration, LRU memory protection)
+- [x] **Phase 7:** Active Cache Invalidation on Mutations (`AdminProductsService.update/archive`, database-first commit, dual-key eviction, slug rename cascading)
+- [x] **Phase 8:** Product List Caching (`PRODUCT_LIST_TTL = 120s`, multi-dimensional pagination envelopes, 200x speedup: ~1,500ms down to ~7ms)
+- [x] **Phase 9:** Query Normalization & Stable Cache Keys (Deterministic alphabetical key sorting, whitespace sanitization, default invariance, SHA-256 length bounding)
+- [x] **Phase 10:** Version-Based List Invalidation (`listVer`) ($\mathcal{O}(1)$ mass list invalidation via atomic `INCR prod:listVer`, eliminating dangerous blocking `KEYS *` scans)
 - [ ] **Phase 11:** Negative Caching (404 Cache Penetration Guard)
 - [ ] **Phase 12:** TTL Jitter (Preventing Expiration Avalanches)
 - [ ] **Phase 13:** Cache Stampede Simulation (The Thundering Herd)
