@@ -107,3 +107,10 @@ export function buildCanonicalListCacheKey(
 
   return `prod:list:v=${listVer}:${serialized}`;
 }
+
+/**
+ * Builds a deterministic negative cache key for nonexistent products to guard against penetration attacks.
+ */
+export function buildNegativeProductKey(idOrSlug: string): string {
+  return `prod:detail:neg:${idOrSlug.trim().toLowerCase()}`;
+}

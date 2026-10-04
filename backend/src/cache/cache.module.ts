@@ -3,6 +3,10 @@ import { ConfigService } from '@nestjs/config';
 import Redis from 'ioredis';
 import { CACHE_PORT } from './cache.port';
 import { RedisCacheAdapter, REDIS_CLIENT } from './redis-cache.adapter';
+import { TtlPolicyService } from './ttl-policy.service';
+import { SingleFlightLockService } from './single-flight-lock.service';
+import { CacheMetricsService } from './cache-metrics.service';
+import { CacheMetricsInterceptor } from '../common/interceptors/cache-metrics.interceptor';
 
 @Global()
 @Module({
@@ -51,8 +55,19 @@ import { RedisCacheAdapter, REDIS_CLIENT } from './redis-cache.adapter';
       provide: CACHE_PORT,
       useClass: RedisCacheAdapter,
     },
+    TtlPolicyService,
+    SingleFlightLockService,
+    CacheMetricsService,
+    CacheMetricsInterceptor,
   ],
-  exports: [CACHE_PORT, REDIS_CLIENT],
+  exports: [
+    CACHE_PORT,
+    REDIS_CLIENT,
+    TtlPolicyService,
+    SingleFlightLockService,
+    CacheMetricsService,
+    CacheMetricsInterceptor,
+  ],
 })
 export class CacheModule implements OnModuleDestroy, OnApplicationShutdown {
   private readonly logger = new Logger(CacheModule.name);

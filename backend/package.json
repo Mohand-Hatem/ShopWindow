@@ -15,7 +15,10 @@
     "test:watch": "jest --watch",
     "test:cov": "jest --coverage",
     "test:e2e": "jest --config ./test/jest-e2e.json",
-    "test:load:baseline": "node ../tests/load/baseline-catalog.js"
+    "test:load:baseline": "node ../tests/load/baseline-catalog.js",
+    "test:simulation:stampede": "ts-node --project ./tsconfig.json ../tests/simulation/stampede-repro.ts",
+    "test:simulation:chaos": "ts-node --project ./tsconfig.json ../tests/simulation/degradation-chaos.ts",
+    "test:benchmark:comparative": "ts-node --project ./tsconfig.json ../tests/simulation/comparative-benchmark.ts"
   },
   "dependencies": {
     "@nestjs/common": "^10.3.3",

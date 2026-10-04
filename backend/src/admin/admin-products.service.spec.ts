@@ -81,7 +81,8 @@ describe('AdminProductsService - Active Invalidation (Unit Tests)', () => {
       });
 
       expect(result).toEqual(mockProduct);
-      expect(mockCache.del).toHaveBeenCalledWith(`prod:detail:slug:${mockProduct.slug}`);
+      expect(mockCache.del).toHaveBeenCalledWith(`prod:detail:neg:${mockProduct.slug.toLowerCase()}`);
+      expect(mockCache.del).toHaveBeenCalledWith(`prod:detail:neg:${mockProduct.id.toLowerCase()}`);
       expect(mockCache.bumpListVersion).toHaveBeenCalled();
     });
   });

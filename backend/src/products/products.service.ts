@@ -6,10 +6,17 @@ import { FindProductsQueryDto } from './dto/find-products-query.dto';
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-export const PRODUCT_DETAIL_TTL = 300; // 5 minutes (300 seconds)
-export const PRODUCT_LIST_TTL = 120;   // 2 minutes (120 seconds)
+export const PRODUCT_DETAIL_TTL = 300;   // 5 minutes (300 seconds)
+export const PRODUCT_LIST_TTL = 120;     // 2 minutes (120 seconds)
+export const PRODUCT_NEGATIVE_TTL = 30;  // 30 seconds (Negative cache for 404 penetration guard)
 
 export type CacheStatus = 'HIT' | 'MISS' | 'BYPASS';
+
+export class CachedNotFoundException extends NotFoundException {
+  constructor(message: string, public readonly cacheStatus: CacheStatus) {
+    super(message);
+  }
+}
 
 export interface ProductDetailResult {
   data: any;
@@ -29,7 +36,13 @@ export interface ProductListResult {
   cacheStatus: CacheStatus;
 }
 
-import { buildCanonicalListCacheKey, normalizeProductQuery } from '../cache/query-normalizer';
+import {
+  buildCanonicalListCacheKey,
+  buildNegativeProductKey,
+  normalizeProductQuery,
+} from '../cache/query-normalizer';
+import { TtlPolicyService } from '../cache/ttl-policy.service';
+import { SingleFlightLockService } from '../cache/single-flight-lock.service';
 
 export const buildListCacheKey = buildCanonicalListCacheKey;
 
@@ -38,6 +51,8 @@ export class ProductsService {
   constructor(
     private readonly prisma: PrismaService,
     @Inject(CACHE_PORT) private readonly cache: CachePort,
+    private readonly ttlPolicy: TtlPolicyService,
+    private readonly singleFlightLock: SingleFlightLockService,
   ) {}
 
   async findAll(query: FindProductsQueryDto): Promise<ProductListResult> {
@@ -45,16 +60,16 @@ export class ProductsService {
     const norm = normalizeProductQuery(query);
     const cacheKey = buildCanonicalListCacheKey(query, listVer);
 
-    // 1. Check Redis for cached collection
-    const cached = await this.cache.get<PaginatedProductsResult>(cacheKey);
-    if (cached) {
+    // 1. Check Redis for cached collection with explicit status
+    const { value: cached, status } = await this.cache.getWithStatus<PaginatedProductsResult>(cacheKey);
+    if (status === 'HIT' && cached) {
       return {
         data: cached,
         cacheStatus: 'HIT',
       };
     }
 
-    // 2. Cache MISS -> execute PostgreSQL queries with normalized inputs
+    // 2. Cache MISS / BYPASS -> execute PostgreSQL queries with normalized inputs
     const page = norm.page;
     const limit = norm.limit;
     const skip = (page - 1) * limit;
@@ -118,62 +133,157 @@ export class ProductsService {
       totalPages,
     };
 
-    // 3. Store collection in Redis with 120s TTL
-    await this.cache.set(cacheKey, result, PRODUCT_LIST_TTL);
+    // 3. Store collection in Redis with jittered 120s TTL (skip if degraded)
+    if (status !== 'BYPASS') {
+      const listTtl = this.ttlPolicy.applyJitter(PRODUCT_LIST_TTL);
+      await this.cache.set(cacheKey, result, listTtl);
+    }
 
     return {
       data: result,
-      cacheStatus: 'MISS',
+      cacheStatus: status === 'BYPASS' ? 'BYPASS' : 'MISS',
     };
   }
 
   /**
-   * Cache-Aside Pattern for Product Detail:
-   * 1. Check Redis for prod:detail:id:{id} or prod:detail:slug:{slug}
-   * 2. If HIT -> Return cached data immediately
-   * 3. If MISS -> Query database, populate both ID and Slug cache keys with 300s TTL, then return
+   * Cache-Aside Pattern with Single-Flight Lock Pattern (Distributed Mutex)
+   * and Negative Caching (Penetration Guard):
+   * 1. Check Redis for positive cache (prod:detail:id:{id} or prod:detail:slug:{slug})
+   * 2. If status is BYPASS -> Fail-open directly to PostgreSQL (zero 500 errors)
+   * 3. Check Redis for negative sentinel (prod:detail:neg:{idOrSlug}) -> If HIT, 404 immediately
+   * 4. If MISS -> Acquire distributed lock via SingleFlightLockService (prod:lock:detail:{idOrSlug})
+   * 5. Winner: Queries PostgreSQL, populates cache with jittered TTL, releases lock, returns { data, cacheStatus: 'MISS' }
+   * 6. Followers: Wait in backoff loop, poll cache, and return { data, cacheStatus: 'HIT' }
    */
   async findByIdOrSlug(idOrSlug: string): Promise<ProductDetailResult> {
     const isUuid = UUID_REGEX.test(idOrSlug);
     const cacheKey = isUuid ? `prod:detail:id:${idOrSlug}` : `prod:detail:slug:${idOrSlug}`;
+    const negativeKey = buildNegativeProductKey(idOrSlug);
 
-    // 1. Check cache
-    const cached = await this.cache.get<any>(cacheKey);
-    if (cached) {
+    // 1. Fast path: Check positive cache
+    const { value: cached, status } = await this.cache.getWithStatus<any>(cacheKey);
+    if (status === 'HIT' && cached) {
       return {
         data: cached,
         cacheStatus: 'HIT',
       };
     }
 
-    // 2. Cache miss -> query Supabase PostgreSQL
-    const where: Prisma.ProductWhereInput = {
-      status: ProductStatus.ACTIVE,
-      ...(isUuid ? { id: idOrSlug } : { slug: idOrSlug }),
-    };
+    // 2. Fail-Open Path: If Redis is down, timed out (>150ms), or disconnected,
+    // immediately query PostgreSQL directly with zero 500 errors
+    if (status === 'BYPASS') {
+      const where: Prisma.ProductWhereInput = {
+        status: ProductStatus.ACTIVE,
+        ...(isUuid ? { id: idOrSlug } : { slug: idOrSlug }),
+      };
 
-    const product = await this.prisma.product.findFirst({
-      where,
-      include: {
-        category: {
-          select: { id: true, name: true, slug: true },
+      const product = await this.prisma.product.findFirst({
+        where,
+        include: {
+          category: {
+            select: { id: true, name: true, slug: true },
+          },
         },
-      },
-    });
+      });
 
-    if (!product) {
-      throw new NotFoundException(`Product with identifier "${idOrSlug}" not found`);
+      if (!product) {
+        throw new CachedNotFoundException(
+          `Product with identifier "${idOrSlug}" not found`,
+          'BYPASS',
+        );
+      }
+
+      return {
+        data: product,
+        cacheStatus: 'BYPASS',
+      };
     }
 
-    // 3. Populate cache under both ID and Slug keys for instant cross-resolution with 5-minute TTL
-    await Promise.all([
-      this.cache.set(`prod:detail:id:${product.id}`, product, PRODUCT_DETAIL_TTL),
-      this.cache.set(`prod:detail:slug:${product.slug}`, product, PRODUCT_DETAIL_TTL),
-    ]);
+    // 3. Fast path: Check negative cache (penetration guard)
+    const isNegativeCached = await this.cache.get<string>(negativeKey);
+    if (isNegativeCached) {
+      throw new CachedNotFoundException(
+        `Product with identifier "${idOrSlug}" not found`,
+        'HIT',
+      );
+    }
+
+    // 4. Cache MISS -> Single-Flight Lock coordinates concurrent requests
+    const lockKey = `prod:lock:detail:${idOrSlug}`;
+
+    const { data, isWinner } = await this.singleFlightLock.executeWithLock<any>(
+      lockKey,
+      async () => {
+        // Double-check cache in case winner populated it right before lock acquisition
+        const doubleCached = await this.cache.get<any>(cacheKey);
+        if (doubleCached) {
+          return doubleCached;
+        }
+        const doubleNegative = await this.cache.get<string>(negativeKey);
+        if (doubleNegative) {
+          throw new CachedNotFoundException(
+            `Product with identifier "${idOrSlug}" not found`,
+            'HIT',
+          );
+        }
+
+        // Query database
+        const where: Prisma.ProductWhereInput = {
+          status: ProductStatus.ACTIVE,
+          ...(isUuid ? { id: idOrSlug } : { slug: idOrSlug }),
+        };
+
+        const product = await this.prisma.product.findFirst({
+          where,
+          include: {
+            category: {
+              select: { id: true, name: true, slug: true },
+            },
+          },
+        });
+
+        if (!product) {
+          // Set negative cache sentinel with jittered 30s TTL to protect DB against penetration attacks
+          const negTtl = this.ttlPolicy.applyJitter(PRODUCT_NEGATIVE_TTL);
+          await this.cache.set(negativeKey, '1', negTtl);
+          throw new CachedNotFoundException(
+            `Product with identifier "${idOrSlug}" not found`,
+            'MISS',
+          );
+        }
+
+        // Populate positive cache under both ID and Slug keys with jittered 5-minute TTL
+        const detailTtl = this.ttlPolicy.applyJitter(PRODUCT_DETAIL_TTL);
+        await Promise.all([
+          this.cache.set(`prod:detail:id:${product.id}`, product, detailTtl),
+          this.cache.set(`prod:detail:slug:${product.slug}`, product, detailTtl),
+        ]);
+
+        return product;
+      },
+      {
+        lockTtlSeconds: 10,
+        retryDelayMs: 40,
+        maxRetries: 30,
+        checkCache: async () => {
+          const pos = await this.cache.get<any>(cacheKey);
+          if (pos) return pos;
+
+          const neg = await this.cache.get<string>(negativeKey);
+          if (neg) {
+            throw new CachedNotFoundException(
+              `Product with identifier "${idOrSlug}" not found`,
+              'HIT',
+            );
+          }
+          return null;
+        },
+      },
+    );
 
     return {
-      data: product,
-      cacheStatus: 'MISS',
+      data,
+      cacheStatus: isWinner ? 'MISS' : 'HIT',
     };
   }
 }

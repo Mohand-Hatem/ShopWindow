@@ -1,4 +1,4 @@
-import { Controller, Get, HttpStatus, Res, Inject } from '@nestjs/common';
+import { Controller, Get, Post, HttpStatus, Res, Inject } from '@nestjs/common';
 import { Response } from 'express';
 import { PrismaService } from '../prisma/prisma.service';
 import { CACHE_PORT, CachePort } from '../cache/cache.port';
@@ -32,9 +32,27 @@ export class HealthController {
       status: isFullyHealthy ? 'ok' : 'degraded',
       database: dbConnected ? 'connected' : 'disconnected',
       cache: cacheConnected ? 'connected' : 'disconnected',
+      queries: {
+        total: this.prisma.queryCount,
+        productDetail: this.prisma.productDetailQueryCount,
+      },
       ...(dbError ? { error: dbError } : {}),
       timestamp: new Date().toISOString(),
       uptimeSeconds: Math.floor(process.uptime()),
     });
   }
+
+  @Post('reset-queries')
+  async resetQueries(@Res() res: Response) {
+    this.prisma.resetQueryCounts();
+    return res.status(HttpStatus.OK).json({
+      success: true,
+      message: 'Query counters reset to 0',
+      queries: {
+        total: this.prisma.queryCount,
+        productDetail: this.prisma.productDetailQueryCount,
+      },
+    });
+  }
 }
+

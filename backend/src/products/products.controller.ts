@@ -22,8 +22,15 @@ export class ProductsController {
     @Param('idOrSlug') idOrSlug: string,
     @Res({ passthrough: true }) res: Response,
   ) {
-    const { data, cacheStatus } = await this.productsService.findByIdOrSlug(idOrSlug);
-    res.setHeader('X-Cache', cacheStatus);
-    return data;
+    try {
+      const { data, cacheStatus } = await this.productsService.findByIdOrSlug(idOrSlug);
+      res.setHeader('X-Cache', cacheStatus);
+      return data;
+    } catch (error: any) {
+      if (error?.cacheStatus) {
+        res.setHeader('X-Cache', error.cacheStatus);
+      }
+      throw error;
+    }
   }
 }

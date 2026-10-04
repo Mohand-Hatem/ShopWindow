@@ -1,0 +1,10 @@
+{
+  "extends": "../backend/tsconfig.json",
+  "compilerOptions": {
+    "baseUrl": "../backend",
+    "typeRoots": ["../backend/node_modules/@types"],
+    "paths": {
+      "*": ["node_modules/*"]
+    }
+  }
+}

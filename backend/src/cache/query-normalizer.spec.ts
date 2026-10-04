@@ -1,4 +1,8 @@
-import { normalizeProductQuery, buildCanonicalListCacheKey } from './query-normalizer';
+import {
+  normalizeProductQuery,
+  buildCanonicalListCacheKey,
+  buildNegativeProductKey,
+} from './query-normalizer';
 
 describe('Query Normalizer & Canonical Cache Key Generator (Unit Tests)', () => {
   describe('normalizeProductQuery()', () => {
@@ -100,6 +104,17 @@ describe('Query Normalizer & Canonical Cache Key Generator (Unit Tests)', () => 
 
       expect(keyA).not.toBe(keyB);
       expect(keyA).not.toBe(keyC);
+    });
+  });
+
+  describe('buildNegativeProductKey()', () => {
+    it('should build lowercase, trimmed negative cache key with prod:detail:neg: prefix', () => {
+      const key1 = buildNegativeProductKey('NonExistent-Product-123');
+      const key2 = buildNegativeProductKey('  nonexistent-product-123  ');
+
+      expect(key1).toBe('prod:detail:neg:nonexistent-product-123');
+      expect(key2).toBe('prod:detail:neg:nonexistent-product-123');
+      expect(key1).toBe(key2);
     });
   });
 });

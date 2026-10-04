@@ -38,8 +38,11 @@ export class AdminProductsService {
       },
     });
 
-    // Invalidate any potential stale negative cache for this slug
-    await this.cache.del(`prod:detail:slug:${created.slug}`);
+    // Invalidate any potential stale negative cache for this slug or id
+    await Promise.all([
+      this.cache.del(`prod:detail:neg:${created.slug.toLowerCase()}`),
+      this.cache.del(`prod:detail:neg:${created.id.toLowerCase()}`),
+    ]);
 
     // Bump catalog list version to immediately invalidate all cached listings in O(1)
     await this.cache.bumpListVersion();
