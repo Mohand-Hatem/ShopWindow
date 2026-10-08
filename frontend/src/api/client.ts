@@ -111,6 +111,7 @@ async function request<T>(
   }
 
   const response = await fetch(url, {
+    cache: 'no-cache',
     ...options,
     headers,
   });
