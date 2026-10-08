@@ -15,27 +15,36 @@ import { CacheMetricsInterceptor } from '../common/interceptors/cache-metrics.in
       provide: REDIS_CLIENT,
       useFactory: (config: ConfigService) => {
         const logger = new Logger('RedisClient');
+        const redisUrl = config.get<string>('REDIS_URL');
         const host = config.get<string>('REDIS_HOST', 'localhost');
         const port = Number(config.get<number>('REDIS_PORT', 6379));
         const password = config.get<string>('REDIS_PASSWORD') || undefined;
+        const useTls = config.get<string>('REDIS_TLS') === 'true' || port === 6380;
 
-        const redis = new Redis({
-          host,
-          port,
-          password,
+        const commonOptions: any = {
           lazyConnect: true,
           enableOfflineQueue: false,
-          retryStrategy: (times) => {
+          retryStrategy: (times: number) => {
             if (times > 3) {
               return null; // Stop retrying so timers do not leak in tests
             }
             return Math.min(times * 100, 1000);
           },
           maxRetriesPerRequest: 3,
-        });
+        };
+
+        const redis = redisUrl
+          ? new Redis(redisUrl, commonOptions)
+          : new Redis({
+              host,
+              port,
+              password,
+              tls: useTls ? {} : undefined,
+              ...commonOptions,
+            });
 
         redis.on('connect', () => {
-          logger.log(`Connected to Redis at ${host}:${port}`);
+          logger.log(`Connected to Redis ${redisUrl ? '(via REDIS_URL)' : `at ${host}:${port}`}`);
         });
 
         redis.on('error', (err) => {
