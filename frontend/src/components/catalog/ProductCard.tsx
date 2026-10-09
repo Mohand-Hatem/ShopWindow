@@ -1,6 +1,8 @@
 import React from 'react';
 import { Link } from 'react-router-dom';
-import type { Product } from '../../api/client';
+import { useQueryClient } from '@tanstack/react-query';
+import { api, type Product } from '../../api/client';
+import { QUERY_KEYS } from '../../hooks/useProducts';
 import { CacheBadge } from '../telemetry/CacheBadge';
 import { ArrowUpRight, PackageCheck, AlertCircle } from 'lucide-react';
 
@@ -15,16 +17,28 @@ export const ProductCard: React.FC<ProductCardProps> = ({
   cacheStatus = 'UNKNOWN',
   durationMs,
 }) => {
+  const queryClient = useQueryClient();
+
   // Generate consistent deterministic placeholder image seeded by product slug
   const imageUrl = `https://picsum.photos/seed/${product.slug}/600/400`;
 
   const isLowStock = product.stock > 0 && product.stock <= 5;
   const isOutOfStock = product.stock <= 0;
 
+  const handlePrefetch = () => {
+    queryClient.prefetchQuery({
+      queryKey: QUERY_KEYS.productDetail(product.slug),
+      queryFn: () => api.getProduct(product.slug),
+      staleTime: 30_000,
+    });
+  };
+
   return (
     <Link
       to={`/products/${product.slug}`}
       viewTransition
+      onMouseEnter={handlePrefetch}
+      onTouchStart={handlePrefetch}
       className="group relative flex flex-col bg-[#000000] border border-frost rounded-2xl overflow-hidden shadow-ring hover:-translate-y-1 hover:border-[#ff801f]/40 transition-all duration-300"
     >
       {/* Top Media Container */}
